@@ -9,9 +9,37 @@
 
 #if defined(ARDUINO_ARCH_ESP32)
 extern "C" {
-  #include "driver/ledc.h"
+#include "driver/ledc.h"
 }
 #endif
+
+enum EffectType {
+  EFFECT_NONE,
+  EFFECT_PULSE,
+  EFFECT_FADE_IN_OUT
+};
+
+struct Effect {
+  EffectType type = EFFECT_NONE;
+  float frequency = 1.0; // Hz
+  float dutyCycle = 50.0; // Percent
+  uint32_t duration = 1000; // ms for one direction
+  uint32_t savedBrightness = 0;
+};
+
+enum EffectState {
+  STATE_IDLE,
+  STATE_PULSE_ON,
+  STATE_PULSE_OFF,
+  STATE_FADE_UP,
+  STATE_FADE_DOWN
+};
+
+struct {
+  Effect config;
+  EffectState state = STATE_IDLE;
+  uint32_t lastStepTime = 0;
+} effects[LEDC_CHANNEL_COUNT];
 
 namespace RemoteKeys {
   enum KeyCode {
@@ -288,6 +316,22 @@ void processSamsungCommand(uint32_t rawCmd) {
       reconfigureLEDCTimer(currentResolution - 1);
       break;
 
+    case RemoteKeys::KEY_GREEN:
+      if (effects[selectedIndex].config.type == EFFECT_FADE_IN_OUT) {
+        stopEffect(selectedIndex);
+      } else {
+        startEffect(selectedIndex, EFFECT_FADE_IN_OUT);
+      }
+      break;
+
+    case RemoteKeys::KEY_RED:
+      if (effects[selectedIndex].config.type == EFFECT_PULSE) {
+        stopEffect(selectedIndex);
+      } else {
+        startEffect(selectedIndex, EFFECT_PULSE);
+      }
+      break;
+
     default:
       Serial.printf("Samsung key (unhandled): 0x%02X\n", cmd);
       break;
@@ -304,6 +348,9 @@ void setup() {
 
   setupLEDCDriver();
 
+  // Initialize fade service.
+  ledc_fade_func_install(0);
+
   // start IR receiver on pin 15, disable built-in LED feedback
   IrReceiver.begin(IR_PIN, DISABLE_LED_FEEDBACK);
   Serial.printf("IR receiver started on pin %u\n", IR_PIN);
@@ -315,6 +362,7 @@ void setup() {
 
 void loop() {
   updateFlash(); // The core function to handle the non-blocking flash logic
+  updateEffects();
 
   if (IrReceiver.decode()) {
     if (IrReceiver.decodedIRData.protocol == SAMSUNG &&
@@ -327,4 +375,64 @@ void loop() {
 
   // keep loop responsive
   yield();
+}
+
+void updateEffects() {
+  uint32_t currentTime = millis();
+  for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
+    if (effects[i].state == STATE_IDLE) continue;
+
+    if (effects[i].config.type == EFFECT_FADE_IN_OUT) {
+      if (currentTime - effects[i].lastStepTime > effects[i].config.duration) {
+        effects[i].lastStepTime = currentTime;
+        if (effects[i].state == STATE_FADE_UP) {
+          effects[i].state = STATE_FADE_DOWN;
+          ledc_set_fade_with_time(LEDC_MODE, (ledc_channel_t)i, 0, effects[i].config.duration);
+          ledc_fade_start(LEDC_MODE, (ledc_channel_t)i, LEDC_FADE_NO_WAIT);
+        } else {
+          effects[i].state = STATE_FADE_UP;
+          ledc_set_fade_with_time(LEDC_MODE, (ledc_channel_t)i, effects[i].config.savedBrightness, effects[i].config.duration);
+          ledc_fade_start(LEDC_MODE, (ledc_channel_t)i, LEDC_FADE_NO_WAIT);
+        }
+      }
+    } else if (effects[i].config.type == EFFECT_PULSE) {
+      float period = 1000.0 / effects[i].config.frequency;
+      float duty = effects[i].config.dutyCycle / 100.0;
+      uint32_t onTime = period * duty;
+      uint32_t offTime = period * (1.0 - duty);
+
+      if (effects[i].state == STATE_PULSE_ON && currentTime - effects[i].lastStepTime > onTime) {
+        effects[i].lastStepTime = currentTime;
+        effects[i].state = STATE_PULSE_OFF;
+        ledcWriteDuty(i, 0);
+      } else if (effects[i].state == STATE_PULSE_OFF && currentTime - effects[i].lastStepTime > offTime) {
+        effects[i].lastStepTime = currentTime;
+        effects[i].state = STATE_PULSE_ON;
+        ledcWriteDuty(i, effects[i].config.savedBrightness);
+      }
+    }
+  }
+}
+
+void startEffect(uint8_t channel, EffectType type) {
+  if (channel >= LEDC_CHANNEL_COUNT) return;
+  effects[channel].config.type = type;
+  effects[channel].config.savedBrightness = brightness[channel];
+  effects[channel].lastStepTime = millis();
+  if (type == EFFECT_FADE_IN_OUT) {
+    effects[channel].state = STATE_FADE_UP;
+    ledc_set_fade_with_time(LEDC_MODE, (ledc_channel_t)channel, effects[channel].config.savedBrightness, effects[channel].config.duration);
+    ledc_fade_start(LEDC_MODE, (ledc_channel_t)channel, LEDC_FADE_NO_WAIT);
+  } else if (type == EFFECT_PULSE) {
+    effects[channel].state = STATE_PULSE_ON;
+    ledcWriteDuty(channel, effects[channel].config.savedBrightness);
+  }
+}
+
+void stopEffect(uint8_t channel) {
+  if (channel >= LEDC_CHANNEL_COUNT) return;
+  effects[channel].state = STATE_IDLE;
+  effects[channel].config.type = EFFECT_NONE;
+  ledc_set_duty(LEDC_MODE, (ledc_channel_t)channel, brightness[channel]);
+  ledc_update_duty(LEDC_MODE, (ledc_channel_t)channel);
 }
