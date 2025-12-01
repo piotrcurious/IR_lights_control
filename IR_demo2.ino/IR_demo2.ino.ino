@@ -6,12 +6,32 @@
 
 #include <Arduino.h>
 #include <IRremote.h>
+#include <Preferences.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
 extern "C" {
   #include "driver/ledc.h"
 }
 #endif
+
+enum EffectType {
+  EFFECT_NONE,
+  EFFECT_PULSE,
+  EFFECT_FADE_IN_OUT
+};
+
+struct Effect {
+  EffectType type = EFFECT_NONE;
+  float frequency = 1.0; // Hz
+  float dutyCycle = 50.0; // Percent
+  uint32_t duration = 2000; // ms for a full fade in/out cycle
+  uint32_t startTime = 0;
+  bool active = false;
+  uint32_t savedBrightness = 0;
+  bool oneShot = false;
+  uint8_t nextChannel = 0xFF; // 0xFF means no chaining
+  EffectType nextEffectType = EFFECT_PULSE;
+};
 
 namespace RemoteKeys {
   enum KeyCode {
@@ -29,6 +49,13 @@ namespace RemoteKeys {
 }
 
 static const uint8_t IR_PIN = 15;
+static const uint8_t LIGHT_SENSOR_PIN = 34;
+static const uint8_t MOTION_SENSOR_PIN = 27;
+
+float globalDimming = 1.0; // 1.0 = no dimming, 0.0 = full dimming
+bool motionDetected = false;
+uint32_t lastMotionTime = 0;
+const uint32_t motionOverrideDuration = 10000; // 10 seconds
 
 // Map digits 0..9 to safe GPIOs
 const uint8_t pwmPins[10] = {2, 4, 16, 17, 18, 19, 21, 22, 23, 25};
@@ -43,6 +70,7 @@ const uint8_t MAX_RESOLUTION = 13;
 
 // brightness stored in integer range [0 .. (2^currentResolution - 1)]
 uint32_t brightness[LEDC_CHANNEL_COUNT];
+Effect effects[LEDC_CHANNEL_COUNT];
 int selectedIndex = 0;
 
 // choose speed mode and timer to use
@@ -83,7 +111,12 @@ static inline void ledcWriteDuty(uint8_t channel, uint32_t duty) {
   if (channel >= LEDC_CHANNEL_COUNT) return;
   uint32_t maxV = maxForRes(currentResolution);
   if (duty > maxV) duty = maxV;
-  ledc_set_duty(LEDC_MODE, (ledc_channel_t)channel, duty);
+
+  // Apply global dimming
+  uint32_t dimmedDuty = duty * globalDimming;
+  if (dimmedDuty > maxV) dimmedDuty = maxV;
+
+  ledc_set_duty(LEDC_MODE, (ledc_channel_t)channel, dimmedDuty);
   ledc_update_duty(LEDC_MODE, (ledc_channel_t)channel);
 }
 
@@ -242,6 +275,18 @@ void handleDigitSelection(int digit) {
 
 void adjustBrightnessByDelta(int32_t deltaSteps) {
   uint32_t maxV = maxForRes(currentResolution);
+  uint32_t currentBrightness = brightness[selectedIndex];
+
+  if (deltaSteps > 0 && currentBrightness >= maxV) {
+    startFlash(selectedIndex);
+    return;
+  }
+
+  if (deltaSteps < 0 && currentBrightness == 0) {
+    startFlash(selectedIndex);
+    return;
+  }
+
   uint32_t step = maxV / 16; if (step == 0) step = 1;
   int64_t newV = (int64_t)brightness[selectedIndex] + (int64_t)deltaSteps * (int64_t)step;
   if (newV < 0) newV = 0;
@@ -251,9 +296,59 @@ void adjustBrightnessByDelta(int32_t deltaSteps) {
   Serial.printf("Channel %d brightness -> %lu/%lu\n", selectedIndex, (unsigned long)brightness[selectedIndex], (unsigned long)maxV);
 }
 
+void startEffect(uint8_t channel, EffectType type) {
+  if (channel >= LEDC_CHANNEL_COUNT) return;
+
+  // Stop any existing effect on the channel
+  stopEffect(channel);
+
+  effects[channel].type = type;
+  effects[channel].active = true;
+  effects[channel].startTime = millis();
+  effects[channel].savedBrightness = brightness[channel];
+
+  Serial.printf("Starting effect %d on channel %d\n", type, channel);
+}
+
+void stopEffect(uint8_t channel) {
+  if (channel >= LEDC_CHANNEL_COUNT) return;
+
+  if (effects[channel].active) {
+    effects[channel].active = false;
+    ledcWriteDuty(channel, effects[channel].savedBrightness);
+    Serial.printf("Stopping effect on channel %d\n", channel);
+  }
+}
+
 void processSamsungCommand(uint32_t rawCmd) {
   uint8_t cmd = rawCmd & 0xFF;
   switch (cmd) {
+    case RemoteKeys::KEY_RED:
+      if (effects[selectedIndex].active && effects[selectedIndex].type == EFFECT_PULSE) {
+        stopEffect(selectedIndex);
+      } else {
+        startEffect(selectedIndex, EFFECT_PULSE);
+      }
+      break;
+    case RemoteKeys::KEY_GREEN:
+      if (effects[selectedIndex].active && effects[selectedIndex].type == EFFECT_FADE_IN_OUT) {
+        stopEffect(selectedIndex);
+      } else {
+        startEffect(selectedIndex, EFFECT_FADE_IN_OUT);
+      }
+      break;
+    case RemoteKeys::KEY_BLUE:
+      effects[selectedIndex].oneShot = true;
+      effects[selectedIndex].nextChannel = (selectedIndex + 1) % LEDC_CHANNEL_COUNT;
+      effects[selectedIndex].nextEffectType = EFFECT_PULSE;
+      startEffect(selectedIndex, EFFECT_PULSE);
+      break;
+    case RemoteKeys::KEY_YELLOW:
+      effects[selectedIndex].oneShot = true;
+      effects[selectedIndex].nextChannel = (selectedIndex + 1) % LEDC_CHANNEL_COUNT;
+      effects[selectedIndex].nextEffectType = EFFECT_FADE_IN_OUT;
+      startEffect(selectedIndex, EFFECT_PULSE);
+      break;
     case RemoteKeys::KEY_0: handleDigitSelection(0); break;
     case RemoteKeys::KEY_1: handleDigitSelection(1); break;
     case RemoteKeys::KEY_2: handleDigitSelection(2); break;
@@ -288,6 +383,10 @@ void processSamsungCommand(uint32_t rawCmd) {
       reconfigureLEDCTimer(currentResolution - 1);
       break;
 
+    case RemoteKeys::KEY_SOURCE:
+      saveSettings();
+      break;
+
     default:
       Serial.printf("Samsung key (unhandled): 0x%02X\n", cmd);
       break;
@@ -295,6 +394,9 @@ void processSamsungCommand(uint32_t rawCmd) {
 }
 
 void setup() {
+  pinMode(LIGHT_SENSOR_PIN, INPUT);
+  pinMode(MOTION_SENSOR_PIN, INPUT);
+
   Serial.begin(115200);
   uint32_t t0 = millis();
   while (!Serial && (millis() - t0) < 500) { /* tiny non-blocking wait */ }
@@ -302,6 +404,7 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 LEDC (driver) + IR remote starting...");
 
+  loadSettings();
   setupLEDCDriver();
 
   // start IR receiver on pin 15, disable built-in LED feedback
@@ -315,6 +418,8 @@ void setup() {
 
 void loop() {
   updateFlash(); // The core function to handle the non-blocking flash logic
+  updateEffects();
+  updateGlobalModifiers();
 
   if (IrReceiver.decode()) {
     if (IrReceiver.decodedIRData.protocol == SAMSUNG &&
@@ -327,4 +432,116 @@ void loop() {
 
   // keep loop responsive
   yield();
+}
+
+void saveSettings() {
+  Preferences preferences;
+  preferences.begin("led_settings", false);
+
+  preferences.putBytes("brightness", brightness, sizeof(brightness));
+  preferences.putBytes("effects", effects, sizeof(effects));
+
+  preferences.end();
+  indicateSave();
+}
+
+void indicateSave() {
+  // Stop all effects to restore base brightness before flashing
+  for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
+    stopEffect(i);
+  }
+
+  // Flash twice
+  for (int i = 0; i < 2; ++i) {
+    // Turn all on
+    for (int ch = 0; ch < LEDC_CHANNEL_COUNT; ++ch) {
+      ledcWriteDuty(ch, maxForRes(currentResolution));
+    }
+    delay(80);
+    // Turn all off
+    for (int ch = 0; ch < LEDC_CHANNEL_COUNT; ++ch) {
+      ledcWriteDuty(ch, 0);
+    }
+    delay(80);
+  }
+
+  // Restore original brightness from the main brightness array
+  for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
+    ledcWriteDuty(i, brightness[i]);
+  }
+}
+
+void loadSettings() {
+  Preferences preferences;
+  preferences.begin("led_settings", true);
+
+  preferences.getBytes("brightness", brightness, sizeof(brightness));
+  preferences.getBytes("effects", effects, sizeof(effects));
+
+  preferences.end();
+}
+
+void updateGlobalModifiers() {
+  // Light sensor logic
+  int lightReading = analogRead(LIGHT_SENSOR_PIN);
+  globalDimming = 1.0 - (float)lightReading / 4095.0; // Dim more in bright light
+
+  // Motion sensor logic
+  motionDetected = digitalRead(MOTION_SENSOR_PIN) == HIGH;
+  if (motionDetected) {
+    lastMotionTime = millis();
+  }
+
+  // Override dimming if motion was detected recently at night
+  const float nightThreshold = 0.5;
+  if (millis() - lastMotionTime < motionOverrideDuration && globalDimming > nightThreshold) {
+    globalDimming = 1.0;
+  }
+}
+
+void updateEffects() {
+  uint32_t currentTime = millis();
+  for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
+    if (effects[i].active) {
+      bool effectFinished = false;
+      uint32_t elapsedTime = currentTime - effects[i].startTime;
+
+      switch (effects[i].type) {
+        case EFFECT_PULSE: {
+          float period = 1000.0 / effects[i].frequency;
+          if (effects[i].oneShot && elapsedTime >= period) {
+            effectFinished = true;
+          } else {
+            uint32_t cycleTime = elapsedTime % (uint32_t)period;
+            float duty = (effects[i].dutyCycle / 100.0) * period;
+            uint32_t newBrightness = (cycleTime < duty) ? effects[i].savedBrightness : 0;
+            ledcWriteDuty(i, newBrightness);
+          }
+          break;
+        }
+        case EFFECT_FADE_IN_OUT: {
+          if (effects[i].oneShot && elapsedTime >= effects[i].duration) {
+            effectFinished = true;
+          } else {
+            float progress = (float)(elapsedTime % effects[i].duration) / (float)effects[i].duration;
+            float sineWave = (sin(progress * 2 * PI - PI / 2) + 1) / 2.0;
+            uint32_t newBrightness = sineWave * effects[i].savedBrightness;
+            ledcWriteDuty(i, newBrightness);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+
+      if (effectFinished) {
+        uint8_t nextChannel = effects[i].nextChannel;
+        EffectType nextEffectType = effects[i].nextEffectType;
+        stopEffect(i);
+        if (nextChannel != 0xFF) {
+          startEffect(nextChannel, nextEffectType);
+        }
+      }
+    }
+  }
 }
