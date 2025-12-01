@@ -37,6 +37,14 @@ const uint8_t pwmPins[10] = {2, 4, 16, 17, 18, 19, 21, 22, 23, 25};
 const int LEDC_CHANNEL_COUNT = 10; // number of channels used
 const int LEDC_FREQ = 5000; // PWM frequency (Hz)
 
+enum EffectState {
+  STATE_IDLE,
+  STATE_PULSE_ON,
+  STATE_PULSE_OFF,
+  STATE_FADE_UP,
+  STATE_FADE_DOWN
+};
+
 enum EffectType {
   EFFECT_NONE,
   EFFECT_PULSE,
@@ -56,14 +64,6 @@ struct Effect {
   EffectType nextEffectType = EFFECT_PULSE;
   EffectState state = STATE_IDLE;
   uint32_t lastStepTime = 0;
-};
-
-enum EffectState {
-  STATE_IDLE,
-  STATE_PULSE_ON,
-  STATE_PULSE_OFF,
-  STATE_FADE_UP,
-  STATE_FADE_DOWN
 };
 
 Effect effects[LEDC_CHANNEL_COUNT];
@@ -614,6 +614,6 @@ void stopEffect(uint8_t channel) {
   if (channel >= LEDC_CHANNEL_COUNT) return;
   effects[channel].state = STATE_IDLE;
   effects[channel].type = EFFECT_NONE;
-  ledc_set_duty(LEDC_MODE, (ledc_channel_t)channel, effects[channel].savedBrightness);
-  ledc_update_duty(LEDC_MODE, (ledc_channel_t)channel);
+  brightness[channel] = effects[channel].savedBrightness;
+  ledcWriteDuty(channel, brightness[channel]);
 }
