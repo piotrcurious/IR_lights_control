@@ -97,6 +97,56 @@ void loadSettings();
 
 
 // =================================================================
+// Global Constants & Variables
+// =================================================================
+
+static const uint8_t IR_PIN = 15;
+const uint8_t pwmPins[8] = {2, 4, 16, 17, 18, 19, 21, 22};
+
+const int LEDC_CHANNEL_COUNT = 8; // number of channels used
+const int LEDC_FREQ = 5000; // PWM frequency (Hz)
+
+Effect effects[LEDC_CHANNEL_COUNT];
+
+// initial resolution (bits)
+uint8_t currentResolution = 8;
+const uint8_t MIN_RESOLUTION = 1;
+const uint8_t MAX_RESOLUTION = 13;
+
+// brightness stored in integer range [0 .. (2^currentResolution - 1)]
+uint32_t brightness[LEDC_CHANNEL_COUNT];
+int selectedIndex = 0;
+bool isChaining = false;
+int sourceChainChannel = -1;
+
+// choose speed mode and timer to use
+const ledc_mode_t LEDC_MODE = LEDC_HIGH_SPEED_MODE;
+const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+
+// Non-blocking flash state (updated for alternating flash)
+struct FlashState {
+  bool active = false;
+  uint32_t savedValue = 0;
+  uint8_t channel = 0xFF;
+  uint8_t blinksRemaining = 0; // The total number of state changes (ON->OFF or OFF->ON) left.
+  uint32_t nextToggleMs = 0;
+  bool isBright = false; // Current state: true for full brightness, false for zero.
+} flashState;
+
+// Non-blocking save indicator state
+struct SaveIndicatorState {
+  bool active = false;
+  uint8_t blinksRemaining = 0;
+  uint32_t nextToggleMs = 0;
+  bool isBright = false;
+} saveIndicatorState;
+
+// Frequency bounds and step
+const float MIN_EFFECT_FREQ = 0.1f;   // 0.1 Hz
+const float MAX_EFFECT_FREQ = 50.0f;  // 50 Hz
+const float FREQ_STEP_RATIO = 1.1f;   // multiply/divide by this on key press
+
+// =================================================================
 // Main Sketch (Setup & Loop)
 // =================================================================
 
