@@ -141,6 +141,8 @@ struct SaveIndicatorState {
   bool isBright = false;
 } saveIndicatorState;
 
+bool wasFading[LEDC_CHANNEL_COUNT];
+
 // Frequency bounds and step
 const float MIN_EFFECT_FREQ = 0.1f;   // 0.1 Hz
 const float MAX_EFFECT_FREQ = 50.0f;  // 50 Hz
@@ -778,9 +780,13 @@ void updateSaveIndicator() {
 
       saveIndicatorState.nextToggleMs = millis() + toggleInterval;
     } else {
-      // Animation finished, restore original brightness
+      // Animation finished, restore original brightness and restart fades
       for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
         ledcWriteDuty(i, brightness[i]);
+        if (wasFading[i]) {
+          // Restart the fade effect that was paused
+          startEffect(i, EFFECT_FADE_IN_OUT, false);
+        }
       }
       saveIndicatorState.active = false;
     }
@@ -788,9 +794,13 @@ void updateSaveIndicator() {
 }
 
 void indicateSave() {
-  // This function provides visual feedback for a save operation.
-  // It intentionally avoids calling stopEffect() so that the effect
-  // configurations are not cleared from memory before being saved.
+  // Stop any hardware fades to prevent conflicts with the save animation
+  for (int i = 0; i < LEDC_CHANNEL_COUNT; ++i) {
+    wasFading[i] = (effects[i].type == EFFECT_FADE_IN_OUT);
+    if (wasFading[i]) {
+      ledc_stop(LEDC_MODE, (ledc_channel_t)i, 0);
+    }
+  }
 
   // Activate the non-blocking save indicator animation
   saveIndicatorState.active = true;
